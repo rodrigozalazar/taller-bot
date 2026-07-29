@@ -32,6 +32,7 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN", "PONÉ_TU_TOKEN_ACÁ")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 MAQUINA, PRODUCTO, CANTIDAD, MINUTOS, MATERIAL, PRECIO = range(6)
+CANCEL_KEYBOARD = ReplyKeyboardMarkup([["Cancelar"]], resize_keyboard=True)
 COT_CLIENTE, COT_PRODUCTO, COT_CANTIDAD, COT_MAQUINA, COT_MINUTOS, COT_MATERIAL = range(6, 12)
 GASTO_CATEGORIA, GASTO_DESCRIPCION, GASTO_MONTO = range(12, 15)
 
@@ -453,13 +454,13 @@ async def venta_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def venta_maquina(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texto = update.message.text.strip().lower()
     context.user_data["maquina"] = "cnc" if "cnc" in texto else "laser"
-    await update.message.reply_text("¿Qué producto o para qué cliente? (texto libre)", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("¿Qué producto o para qué cliente? (texto libre)", reply_markup=CANCEL_KEYBOARD)
     return PRODUCTO
 
 
 async def venta_producto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["producto"] = update.message.text.strip()
-    await update.message.reply_text("¿Cantidad de piezas?")
+    await update.message.reply_text("¿Cantidad de piezas?", reply_markup=CANCEL_KEYBOARD)
     return CANTIDAD
 
 
@@ -469,7 +470,7 @@ async def venta_cantidad(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Mandame un número entero, ej: 20")
         return CANTIDAD
-    await update.message.reply_text("¿Cuántos minutos totales de máquina llevó?")
+    await update.message.reply_text("¿Cuántos minutos totales de máquina llevó?", reply_markup=CANCEL_KEYBOARD)
     return MINUTOS
 
 
@@ -479,7 +480,7 @@ async def venta_minutos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Mandame un número, ej: 45 o 45.5")
         return MINUTOS
-    await update.message.reply_text("¿Costo de material total? (0 si no aplica)")
+    await update.message.reply_text("¿Costo de material total? (0 si no aplica)", reply_markup=CANCEL_KEYBOARD)
     return MATERIAL
 
 
@@ -495,7 +496,7 @@ async def venta_material(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "cargá igual un 30-40% del valor de un tablero nuevo equivalente — no es gratis, "
             "tiene valor de reposición real."
         )
-    await update.message.reply_text("¿Precio total cobrado?")
+    await update.message.reply_text("¿Precio total cobrado?", reply_markup=CANCEL_KEYBOARD)
     return PRECIO
 
 
@@ -536,29 +537,38 @@ async def venta_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def comando_inesperado(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "⚠️ Estás a mitad de una carga. Tocá el botón *Cancelar* (o mandá /cancelar) "
+        "antes de usar otro comando.",
+        parse_mode="Markdown"
+    )
+    return None  # no cambia de estado, sigue esperando la respuesta pendiente
+
+
 # ---------- Comando /cotizar (precio de MERCADO, para encargos a clientes) ----------
 async def cotizar_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["cot_modo"] = "mercado"
-    await update.message.reply_text("¿Nombre del cliente?")
+    await update.message.reply_text("¿Nombre del cliente?", reply_markup=CANCEL_KEYBOARD)
     return COT_CLIENTE
 
 
 # ---------- Comando /cotizarmayorista (precio PISO, para clientes mayoristas) ----------
 async def cotizarmayorista_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["cot_modo"] = "mayorista"
-    await update.message.reply_text("¿Nombre del cliente/comercio mayorista?")
+    await update.message.reply_text("¿Nombre del cliente/comercio mayorista?", reply_markup=CANCEL_KEYBOARD)
     return COT_CLIENTE
 
 
 async def cotizar_cliente(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["cot_cliente"] = update.message.text.strip()
-    await update.message.reply_text("¿Qué producto o trabajo vas a cotizar? (texto libre)")
+    await update.message.reply_text("¿Qué producto o trabajo vas a cotizar? (texto libre)", reply_markup=CANCEL_KEYBOARD)
     return COT_PRODUCTO
 
 
 async def cotizar_producto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["cot_producto"] = update.message.text.strip()
-    await update.message.reply_text("¿Cantidad de piezas?")
+    await update.message.reply_text("¿Cantidad de piezas?", reply_markup=CANCEL_KEYBOARD)
     return COT_CANTIDAD
 
 
@@ -576,7 +586,7 @@ async def cotizar_cantidad(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cotizar_maquina(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texto = update.message.text.strip().lower()
     context.user_data["cot_maquina"] = "cnc" if "cnc" in texto else "laser"
-    await update.message.reply_text("¿Cuántos minutos totales estimás de máquina (para todas las piezas)?", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("¿Cuántos minutos totales estimás de máquina (para todas las piezas)?", reply_markup=CANCEL_KEYBOARD)
     return COT_MINUTOS
 
 
@@ -586,7 +596,7 @@ async def cotizar_minutos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Mandame un número, ej: 35")
         return COT_MINUTOS
-    await update.message.reply_text("¿Costo de material total estimado? (0 si no aplica)")
+    await update.message.reply_text("¿Costo de material total estimado? (0 si no aplica)", reply_markup=CANCEL_KEYBOARD)
     return COT_MATERIAL
 
 
@@ -951,13 +961,13 @@ async def gasto_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def gasto_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["gasto_categoria"] = update.message.text.strip()
-    await update.message.reply_text("¿Descripción del gasto? (ej: fresa compression 8mm)", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("¿Descripción del gasto? (ej: fresa compression 8mm)", reply_markup=CANCEL_KEYBOARD)
     return GASTO_DESCRIPCION
 
 
 async def gasto_descripcion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["gasto_descripcion"] = update.message.text.strip()
-    await update.message.reply_text("¿Monto del gasto?")
+    await update.message.reply_text("¿Monto del gasto?", reply_markup=CANCEL_KEYBOARD)
     return GASTO_MONTO
 
 
@@ -1109,7 +1119,8 @@ def main():
             MATERIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, venta_material)],
             PRECIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, venta_precio)],
         },
-        fallbacks=[CommandHandler("cancelar", venta_cancelar)],
+        fallbacks=[CommandHandler("cancelar", venta_cancelar), MessageHandler(filters.Regex("(?i)^cancelar$"), venta_cancelar), MessageHandler(filters.COMMAND, comando_inesperado)],
+        allow_reentry=True,
     )
 
     app.add_handler(CommandHandler("start", start))
@@ -1128,7 +1139,8 @@ def main():
             COT_MINUTOS: [MessageHandler(filters.TEXT & ~filters.COMMAND, cotizar_minutos)],
             COT_MATERIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, cotizar_material)],
         },
-        fallbacks=[CommandHandler("cancelar", cotizar_cancelar)],
+        fallbacks=[CommandHandler("cancelar", cotizar_cancelar), MessageHandler(filters.Regex("(?i)^cancelar$"), cotizar_cancelar), MessageHandler(filters.COMMAND, comando_inesperado)],
+        allow_reentry=True,
     )
     app.add_handler(cotizar_conv)
 
@@ -1143,7 +1155,8 @@ def main():
             GASTO_DESCRIPCION: [MessageHandler(filters.TEXT & ~filters.COMMAND, gasto_descripcion)],
             GASTO_MONTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, gasto_monto)],
         },
-        fallbacks=[CommandHandler("cancelar", gasto_cancelar)],
+        fallbacks=[CommandHandler("cancelar", gasto_cancelar), MessageHandler(filters.Regex("(?i)^cancelar$"), gasto_cancelar), MessageHandler(filters.COMMAND, comando_inesperado)],
+        allow_reentry=True,
     )
     app.add_handler(gasto_conv)
     app.add_handler(CommandHandler("gastos", gastos))
