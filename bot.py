@@ -17,6 +17,8 @@ Comandos:
 import os
 import sqlite3
 import threading
+import csv
+import io
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
@@ -80,7 +82,41 @@ def init_db():
     conn.close()
 
 
-def get_config():
+def todas_las_ventas():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        SELECT fecha, maquina, producto, cantidad, minutos, material, precio, usuario
+        FROM ventas ORDER BY fecha ASC
+    """)
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+# ---------- Comando /backup ----------
+async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = todas_las_ventas()
+    if not rows:
+        await update.message.reply_text("No hay ventas cargadas todavía.")
+        return
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["fecha", "maquina", "producto", "cantidad", "minutos", "material", "precio", "usuario"])
+    writer.writerows(rows)
+
+    data = io.BytesIO(output.getvalue().encode("utf-8"))
+    data.name = f"backup-produccion-{datetime.now().strftime('%Y-%m-%d')}.csv"
+
+    await update.message.reply_document(
+        document=data,
+        filename=data.name,
+        caption=f"📦 Backup completo — {len(rows)} venta(s) cargada(s)."
+    )
+
+
+
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT clave, valor FROM config")
@@ -301,7 +337,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/venta - cargar una venta nueva\n"
         "/resumen - ver el mes actual\n"
         "/mes 2026-06 - ver un mes específico\n"
-        "/tarifas - ver o cambiar tarifas y sueldo"
+        "/tarifas - ver o cambiar tarifas y sueldo\n"
+        "/backup - descargar todas las ventas en CSV"
     )
 
 
@@ -331,6 +368,7 @@ def main():
     app.add_handler(CommandHandler("resumen", resumen))
     app.add_handler(CommandHandler("mes", resumen_mes))
     app.add_handler(CommandHandler("tarifas", tarifas))
+    app.add_handler(CommandHandler("backup", backup))
 
     print("Bot corriendo...")
     app.run_polling()
