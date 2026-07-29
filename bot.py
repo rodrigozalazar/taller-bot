@@ -79,7 +79,11 @@ def init_db():
             valor REAL NOT NULL
         )
     """)
-    defaults = {"tarifa_cnc": 55, "tarifa_laser": 54, "sueldo_hora": 9500}
+    defaults = {
+        "tarifa_cnc": 55, "tarifa_laser": 54, "sueldo_hora": 9500,
+        "cnc_usd_min": 0.26, "laser_usd_min": 0.40, "sueldo_usd_hora": 6.15,
+        "dolar_actual": 1545
+    }
     for k, v in defaults.items():
         c.execute(
             "INSERT INTO config (clave, valor) VALUES (%s, %s) ON CONFLICT (clave) DO NOTHING",
@@ -147,7 +151,33 @@ def todas_las_ventas():
     return rows
 
 
-# ---------- Comando /venta (conversación guiada) ----------
+def ultimas_ventas(cantidad=10):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, fecha, maquina, producto, cantidad, precio
+        FROM ventas ORDER BY id DESC LIMIT %s
+    """, (cantidad,))
+    rows = c.fetchall()
+    c.close()
+    conn.close()
+    return rows
+
+
+def borrar_venta_por_id(venta_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT id FROM ventas WHERE id = %s", (venta_id,))
+    existe = c.fetchone()
+    if existe:
+        c.execute("DELETE FROM ventas WHERE id = %s", (venta_id,))
+        conn.commit()
+    c.close()
+    conn.close()
+    return existe is not None
+
+
+
 async def venta_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = ReplyKeyboardMarkup([["CNC", "Láser"]], one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text("¿Qué máquina usaste?", reply_markup=keyboard)
@@ -322,7 +352,106 @@ async def tarifas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Listo, {context.args[0]} actualizado a {valor}")
 
 
-# ---------- Comando /backup ----------
+# ---------- Comando /ultimas ----------
+async def ultimas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = ultimas_ventas(10)
+    if not rows:
+        await update.message.reply_text("No hay ventas cargadas todavía.")
+        return
+
+    lineas = ["🕐 Últimas 10 ventas:\n"]
+    for venta_id, fecha, maquina, producto, cantidad, precio in rows:
+        m = "CNC" if maquina == "cnc" else "Láser"
+        lineas.append(f"#{venta_id} — {fecha} — {m} — {producto} ×{cantidad} — ${precio:,.0f}")
+    lineas.append("\nPara borrar alguna: /borrar <número>, ej: /borrar 7")
+    await update.message.reply_text("\n".join(lineas))
+
+
+# ---------- Comando /borrar ----------
+async def borrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usá el formato: /borrar 7 (mirá el número con /ultimas)")
+        return
+    try:
+        venta_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Mandame un número de venta válido, ej: /borrar 7")
+        return
+
+    ok = borrar_venta_por_id(venta_id)
+    if ok:
+        await update.message.reply_text(f"🗑️ Venta #{venta_id} borrada correctamente.")
+    else:
+        await update.message.reply_text(f"No encontré ninguna venta con el número #{venta_id}. Revisá con /ultimas.")
+
+
+
+async def dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg = get_config()
+
+    if not context.args:
+        await update.message.reply_text(
+            f"Dólar de referencia actual: ${cfg.get('dolar_actual', 0):.0f}\n\n"
+            f"Tarifas base en USD (no cambian):\n"
+            f"CNC: USD {cfg['cnc_usd_min']:.2f}/min\n"
+            f"Láser: USD {cfg['laser_usd_min']:.2f}/min\n"
+            f"Sueldo: USD {cfg['sueldo_usd_hora']:.2f}/hora\n\n"
+            f"Para actualizar con el dólar de hoy: /dolar 1600\n"
+            f"Para cambiar una tarifa base en USD: /basedolar cnc 0.26"
+        )
+        return
+
+    try:
+        valor_dolar = float(context.args[0].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("Mandame un número, ej: /dolar 1600")
+        return
+
+    nueva_cnc = cfg["cnc_usd_min"] * valor_dolar
+    nueva_laser = cfg["laser_usd_min"] * valor_dolar
+    nuevo_sueldo = cfg["sueldo_usd_hora"] * valor_dolar
+
+    set_config("tarifa_cnc", nueva_cnc)
+    set_config("tarifa_laser", nueva_laser)
+    set_config("sueldo_hora", nuevo_sueldo)
+    set_config("dolar_actual", valor_dolar)
+
+    await update.message.reply_text(
+        f"💵 Tarifas actualizadas con dólar a ${valor_dolar:.0f}\n\n"
+        f"CNC: ${nueva_cnc:,.0f}/min (antes ${cfg['tarifa_cnc']:,.0f})\n"
+        f"Láser: ${nueva_laser:,.0f}/min (antes ${cfg['tarifa_laser']:,.0f})\n"
+        f"Sueldo: ${nuevo_sueldo:,.0f}/hora (antes ${cfg['sueldo_hora']:,.0f})\n\n"
+        f"Las ventas nuevas que cargues van a usar estos valores."
+    )
+
+
+# ---------- Comando /basedolar (para ajustar las tarifas base en USD, poco frecuente) ----------
+async def basedolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "Formato: /basedolar cnc 0.26  |  /basedolar laser 0.40  |  /basedolar sueldo 6.15\n\n"
+            "Esto cambia la tarifa BASE en dólares (la referencia que se usa con /dolar), "
+            "no la tarifa en pesos directamente."
+        )
+        return
+    clave_map = {"cnc": "cnc_usd_min", "laser": "laser_usd_min", "sueldo": "sueldo_usd_hora"}
+    clave = clave_map.get(context.args[0].lower())
+    if not clave:
+        await update.message.reply_text("Usá: cnc, laser o sueldo")
+        return
+    try:
+        valor = float(context.args[1].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("Mandame un número válido, ej: 0.26")
+        return
+    set_config(clave, valor)
+    await update.message.reply_text(
+        f"Listo, base en USD de {context.args[0]} actualizada a {valor}.\n"
+        f"Usá /dolar <valor> para recalcular las tarifas en pesos con este nuevo valor base."
+    )
+
+
+
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = todas_las_ventas()
     if not rows:
@@ -351,6 +480,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/resumen - ver el mes actual\n"
         "/mes 2026-06 - ver un mes específico\n"
         "/tarifas - ver o cambiar tarifas y sueldo\n"
+        "/dolar 1600 - recalcular tarifas y sueldo según el dólar de hoy\n"
+        "/ultimas - ver las últimas 10 ventas con su número\n"
+        "/borrar 7 - borrar una venta cargada por error\n"
         "/backup - descargar todas las ventas en CSV"
     )
 
@@ -381,6 +513,10 @@ def main():
     app.add_handler(CommandHandler("mes", resumen_mes))
     app.add_handler(CommandHandler("tarifas", tarifas))
     app.add_handler(CommandHandler("backup", backup))
+    app.add_handler(CommandHandler("dolar", dolar))
+    app.add_handler(CommandHandler("basedolar", basedolar))
+    app.add_handler(CommandHandler("ultimas", ultimas))
+    app.add_handler(CommandHandler("borrar", borrar))
 
     print("Bot corriendo (base de datos persistente)...")
     app.run_polling()
