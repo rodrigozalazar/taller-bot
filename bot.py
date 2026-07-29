@@ -33,6 +33,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 MAQUINA, PRODUCTO, CANTIDAD, MINUTOS, MATERIAL, PRECIO = range(6)
 COT_CLIENTE, COT_PRODUCTO, COT_CANTIDAD, COT_MAQUINA, COT_MINUTOS, COT_MATERIAL = range(6, 12)
+GASTO_CATEGORIA, GASTO_DESCRIPCION, GASTO_MONTO = range(12, 15)
 
 
 # ---------- Servidor web mínimo (para que Render lo trate como Web Service gratuito) ----------
@@ -80,12 +81,24 @@ def init_db():
             valor REAL NOT NULL
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS gastos (
+            id SERIAL PRIMARY KEY,
+            fecha TEXT NOT NULL,
+            categoria TEXT NOT NULL,
+            descripcion TEXT NOT NULL,
+            monto REAL NOT NULL,
+            usuario TEXT
+        )
+    """)
     defaults = {
         "tarifa_cnc": 98.36, "tarifa_laser": 56.80, "sueldo_hora": 8825,
         "cnc_usd_min": 0.26, "laser_usd_min": 0.40, "sueldo_usd_hora": 5.71,
         "tarifa_cnc_usd_min": 0.0637, "tarifa_laser_usd_min": 0.0368,
         "dolar_actual": 1545, "margen_pct": 40,
-        "tarifa_mercado_cnc": 400, "tarifa_mercado_laser": 618
+        "tarifa_mercado_cnc": 400, "tarifa_mercado_laser": 618,
+        "horas_acum_tubo_min": 0, "horas_acum_fresa_min": 0,
+        "limite_tubo_horas": 7000, "limite_fresa_horas": 55
     }
     for k, v in defaults.items():
         c.execute(
@@ -126,6 +139,38 @@ def guardar_venta(fecha, maquina, producto, cantidad, minutos, material, precio,
     conn.commit()
     c.close()
     conn.close()
+    # Suma automática al contador de vida útil (tubo láser o fresa CNC)
+    if maquina == "laser":
+        cfg = get_config()
+        set_config("horas_acum_tubo_min", cfg.get("horas_acum_tubo_min", 0) + minutos)
+    elif maquina == "cnc":
+        cfg = get_config()
+        set_config("horas_acum_fresa_min", cfg.get("horas_acum_fresa_min", 0) + minutos)
+
+
+def guardar_gasto(fecha, categoria, descripcion, monto, usuario):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO gastos (fecha, categoria, descripcion, monto, usuario)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (fecha, categoria, descripcion, monto, usuario))
+    conn.commit()
+    c.close()
+    conn.close()
+
+
+def gastos_del_mes(anio_mes):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT fecha, categoria, descripcion, monto
+        FROM gastos WHERE fecha LIKE %s ORDER BY fecha DESC
+    """, (anio_mes + "%",))
+    rows = c.fetchall()
+    c.close()
+    conn.close()
+    return rows
 
 
 def ventas_del_mes(anio_mes):
@@ -444,6 +489,12 @@ async def venta_material(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Mandame un número, ej: 3200")
         return MATERIAL
+    if context.user_data["material"] == 0:
+        await update.message.reply_text(
+            "💡 Ojo: $0 solo si el CLIENTE puso el material. Si usaste retazo/sobra propia, "
+            "cargá igual un 30-40% del valor de un tablero nuevo equivalente — no es gratis, "
+            "tiene valor de reposición real."
+        )
     await update.message.reply_text("¿Precio total cobrado?")
     return PRECIO
 
@@ -545,6 +596,12 @@ async def cotizar_material(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Mandame un número, ej: 3200")
         return COT_MATERIAL
+
+    if material == 0:
+        await update.message.reply_text(
+            "💡 Ojo: $0 solo si el CLIENTE pone el material. Si vas a usar retazo/sobra propia, "
+            "cargá igual un 30-40% del valor de reposición — no es gratis."
+        )
 
     d = context.user_data
     cfg = get_config()
@@ -882,6 +939,116 @@ async def basedolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ---------- Comando /gasto (conversación guiada) ----------
+async def gasto_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = ReplyKeyboardMarkup(
+        [["Fresas", "Tubo láser"], ["Mantenimiento", "Otro"]],
+        one_time_keyboard=True, resize_keyboard=True
+    )
+    await update.message.reply_text("¿Categoría del gasto?", reply_markup=keyboard)
+    return GASTO_CATEGORIA
+
+
+async def gasto_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["gasto_categoria"] = update.message.text.strip()
+    await update.message.reply_text("¿Descripción del gasto? (ej: fresa compression 8mm)", reply_markup=ReplyKeyboardRemove())
+    return GASTO_DESCRIPCION
+
+
+async def gasto_descripcion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["gasto_descripcion"] = update.message.text.strip()
+    await update.message.reply_text("¿Monto del gasto?")
+    return GASTO_MONTO
+
+
+async def gasto_monto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        monto = float(update.message.text.strip().replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("Mandame un número, ej: 30000")
+        return GASTO_MONTO
+
+    d = context.user_data
+    fecha = datetime.now().strftime("%Y-%m-%d")
+    usuario = update.effective_user.first_name or "desconocido"
+    guardar_gasto(fecha, d["gasto_categoria"], d["gasto_descripcion"], monto, usuario)
+
+    # Si es un gasto de reposición, ofrecer reiniciar el contador de vida útil
+    aviso_reset = ""
+    if d["gasto_categoria"] == "Tubo láser":
+        set_config("horas_acum_tubo_min", 0)
+        aviso_reset = "\n\n🔄 Contador de horas del tubo láser reiniciado a 0."
+    elif d["gasto_categoria"] == "Fresas":
+        aviso_reset = "\n\n💡 Si esta fresa reemplaza a la anterior por desgaste, usá /resetvidautil fresa para reiniciar el contador."
+
+    await update.message.reply_text(
+        f"💸 Gasto registrado.\n\n"
+        f"Categoría: {d['gasto_categoria']}\n"
+        f"Descripción: {d['gasto_descripcion']}\n"
+        f"Monto: ${monto:,.0f}"
+        f"{aviso_reset}\n\n"
+        f"Usá /gastos para ver el total del mes."
+    )
+    return ConversationHandler.END
+
+
+async def gasto_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Carga cancelada.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+
+# ---------- Comando /gastos (ver resumen del mes) ----------
+async def gastos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    anio_mes = context.args[0] if context.args else datetime.now().strftime("%Y-%m")
+    rows = gastos_del_mes(anio_mes)
+    if not rows:
+        await update.message.reply_text(f"No hay gastos cargados en {anio_mes}.")
+        return
+
+    total = sum(r[3] for r in rows)
+    por_categoria = {}
+    for fecha, categoria, descripcion, monto in rows:
+        por_categoria[categoria] = por_categoria.get(categoria, 0) + monto
+
+    lineas = [f"💸 Gastos de {anio_mes}\n", f"Total: ${total:,.0f}\n"]
+    for cat, monto in sorted(por_categoria.items(), key=lambda x: -x[1]):
+        lineas.append(f"— {cat}: ${monto:,.0f}")
+    lineas.append(f"\n{len(rows)} gasto(s) cargado(s).")
+    await update.message.reply_text("\n".join(lineas))
+
+
+# ---------- Comando /vidautil ----------
+async def vidautil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg = get_config()
+    horas_tubo = cfg.get("horas_acum_tubo_min", 0) / 60
+    horas_fresa = cfg.get("horas_acum_fresa_min", 0) / 60
+    limite_tubo = cfg.get("limite_tubo_horas", 7000)
+    limite_fresa = cfg.get("limite_fresa_horas", 55)
+
+    pct_tubo = (horas_tubo / limite_tubo * 100) if limite_tubo else 0
+    pct_fresa = (horas_fresa / limite_fresa * 100) if limite_fresa else 0
+
+    alerta_tubo = "⚠️ " if pct_tubo >= 80 else ""
+    alerta_fresa = "⚠️ " if pct_fresa >= 80 else ""
+
+    await update.message.reply_text(
+        f"🔧 Vida útil de consumibles\n\n"
+        f"{alerta_tubo}Tubo láser: {horas_tubo:.1f}h de {limite_tubo:.0f}h ({pct_tubo:.0f}%)\n"
+        f"{alerta_fresa}Fresa CNC actual: {horas_fresa:.1f}h de {limite_fresa:.0f}h ({pct_fresa:.0f}%)\n\n"
+        f"Cuando reemplaces alguno, reiniciá el contador con:\n"
+        f"/resetvidautil tubo\n/resetvidautil fresa"
+    )
+
+
+async def resetvidautil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or context.args[0].lower() not in ("tubo", "fresa"):
+        await update.message.reply_text("Usá: /resetvidautil tubo  o  /resetvidautil fresa")
+        return
+    clave = "horas_acum_tubo_min" if context.args[0].lower() == "tubo" else "horas_acum_fresa_min"
+    set_config(clave, 0)
+    await update.message.reply_text(f"✅ Contador de {context.args[0]} reiniciado a 0 horas.")
+
+
 
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = todas_las_ventas()
@@ -917,6 +1084,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/dolar 1600 - recalcular tarifas y sueldo según el dólar de hoy\n"
         "/ultimas - ver las últimas 10 ventas con su número\n"
         "/borrar 7 - borrar una venta cargada por error\n"
+        "/gasto - registrar un gasto general (fresas, mantenimiento, etc.)\n"
+        "/gastos - ver total de gastos del mes\n"
+        "/vidautil - ver horas acumuladas del tubo láser y la fresa CNC\n"
+        "/resetvidautil tubo - reiniciar contador al reemplazar\n"
         "/backup - descargar todas las ventas en CSV"
     )
 
@@ -965,6 +1136,19 @@ def main():
     app.add_handler(CommandHandler("resumen", resumen))
     app.add_handler(CommandHandler("mes", resumen_mes))
     app.add_handler(CommandHandler("tarifas", tarifas))
+    gasto_conv = ConversationHandler(
+        entry_points=[CommandHandler("gasto", gasto_start)],
+        states={
+            GASTO_CATEGORIA: [MessageHandler(filters.TEXT & ~filters.COMMAND, gasto_categoria)],
+            GASTO_DESCRIPCION: [MessageHandler(filters.TEXT & ~filters.COMMAND, gasto_descripcion)],
+            GASTO_MONTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, gasto_monto)],
+        },
+        fallbacks=[CommandHandler("cancelar", gasto_cancelar)],
+    )
+    app.add_handler(gasto_conv)
+    app.add_handler(CommandHandler("gastos", gastos))
+    app.add_handler(CommandHandler("vidautil", vidautil))
+    app.add_handler(CommandHandler("resetvidautil", resetvidautil))
     app.add_handler(CommandHandler("backup", backup))
     app.add_handler(CommandHandler("dolar", dolar))
     app.add_handler(CommandHandler("basedolar", basedolar))
