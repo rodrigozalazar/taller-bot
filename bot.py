@@ -1,31 +1,38 @@
 """
 Bot de Telegram - Registro de producción CNC + Láser
 ------------------------------------------------------
-Guarda cada venta en una base de datos SQLite en el servidor.
-Como los datos viven en el servidor (no en tu celular/PC), se ven
-sincronizados automáticamente sin importar desde qué dispositivo entrás
-a Telegram.
+Versión con base de datos PERSISTENTE (PostgreSQL en Supabase).
+Los datos ya NO viven en el disco de Render, así que sobreviven a
+cualquier redespliegue, reinicio o actualización del código.
 
 Comandos:
   /venta      -> carga una venta paso a paso (conversación guiada)
   /resumen    -> resumen del mes actual (ingresos, costos, sueldo, utilidad)
   /mes <YYYY-MM> -> resumen de un mes específico, ej: /mes 2026-06
   /tarifas    -> ver o cambiar las tarifas de costo (ARS/min) y tu sueldo/hora
+  /backup     -> descarga un CSV con todas las ventas cargadas
   /cancelar   -> cancela la carga en curso
 """
 
 import os
-import sqlite3
 import threading
 import csv
 import io
 from datetime import datetime
+import psycopg2
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ConversationHandler,
     ContextTypes, filters
 )
+
+# ---------- Configuración ----------
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "PONÉ_TU_TOKEN_ACÁ")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+MAQUINA, PRODUCTO, CANTIDAD, MINUTOS, MATERIAL, PRECIO = range(6)
+
 
 # ---------- Servidor web mínimo (para que Render lo trate como Web Service gratuito) ----------
 class HealthHandler(BaseHTTPRequestHandler):
@@ -36,7 +43,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot corriendo")
 
     def log_message(self, format, *args):
-        pass  # silencia el log de cada request para no llenar la consola
+        pass
 
 
 def start_web_server():
@@ -44,20 +51,18 @@ def start_web_server():
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     server.serve_forever()
 
-# ---------- Configuración ----------
-TOKEN = os.environ.get("TELEGRAM_TOKEN", "PONÉ_TU_TOKEN_ACÁ")
-DB_PATH = os.environ.get("DB_PATH", "produccion.db")
 
-MAQUINA, PRODUCTO, CANTIDAD, MINUTOS, MATERIAL, PRECIO = range(6)
+# ---------- Base de datos (PostgreSQL persistente) ----------
+def get_conn():
+    return psycopg2.connect(DATABASE_URL)
 
 
-# ---------- Base de datos ----------
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS ventas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             fecha TEXT NOT NULL,
             maquina TEXT NOT NULL,
             producto TEXT NOT NULL,
@@ -74,84 +79,70 @@ def init_db():
             valor REAL NOT NULL
         )
     """)
-    # Valores por defecto (los mismos que ya veníamos usando)
     defaults = {"tarifa_cnc": 55, "tarifa_laser": 54, "sueldo_hora": 9500}
     for k, v in defaults.items():
-        c.execute("INSERT OR IGNORE INTO config (clave, valor) VALUES (?, ?)", (k, v))
+        c.execute(
+            "INSERT INTO config (clave, valor) VALUES (%s, %s) ON CONFLICT (clave) DO NOTHING",
+            (k, v)
+        )
     conn.commit()
+    c.close()
     conn.close()
 
 
+def get_config():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT clave, valor FROM config")
+    rows = dict(c.fetchall())
+    c.close()
+    conn.close()
+    return rows
+
+
+def set_config(clave, valor):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE config SET valor = %s WHERE clave = %s", (valor, clave))
+    conn.commit()
+    c.close()
+    conn.close()
+
+
+def guardar_venta(fecha, maquina, producto, cantidad, minutos, material, precio, usuario):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO ventas (fecha, maquina, producto, cantidad, minutos, material, precio, usuario)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    """, (fecha, maquina, producto, cantidad, minutos, material, precio, usuario))
+    conn.commit()
+    c.close()
+    conn.close()
+
+
+def ventas_del_mes(anio_mes):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT fecha, maquina, producto, cantidad, minutos, material, precio
+        FROM ventas WHERE fecha LIKE %s ORDER BY fecha DESC
+    """, (anio_mes + "%",))
+    rows = c.fetchall()
+    c.close()
+    conn.close()
+    return rows
+
+
 def todas_las_ventas():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("""
         SELECT fecha, maquina, producto, cantidad, minutos, material, precio, usuario
         FROM ventas ORDER BY fecha ASC
     """)
     rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-# ---------- Comando /backup ----------
-async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = todas_las_ventas()
-    if not rows:
-        await update.message.reply_text("No hay ventas cargadas todavía.")
-        return
-
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["fecha", "maquina", "producto", "cantidad", "minutos", "material", "precio", "usuario"])
-    writer.writerows(rows)
-
-    data = io.BytesIO(output.getvalue().encode("utf-8"))
-    data.name = f"backup-produccion-{datetime.now().strftime('%Y-%m-%d')}.csv"
-
-    await update.message.reply_document(
-        document=data,
-        filename=data.name,
-        caption=f"📦 Backup completo — {len(rows)} venta(s) cargada(s)."
-    )
-
-
-
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT clave, valor FROM config")
-    rows = dict(c.fetchall())
-    conn.close()
-    return rows
-
-
-def set_config(clave, valor):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE config SET valor = ? WHERE clave = ?", (valor, clave))
-    conn.commit()
-    conn.close()
-
-
-def guardar_venta(fecha, maquina, producto, cantidad, minutos, material, precio, usuario):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO ventas (fecha, maquina, producto, cantidad, minutos, material, precio, usuario)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (fecha, maquina, producto, cantidad, minutos, material, precio, usuario))
-    conn.commit()
-    conn.close()
-
-
-def ventas_del_mes(anio_mes):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        SELECT fecha, maquina, producto, cantidad, minutos, material, precio
-        FROM ventas WHERE fecha LIKE ? ORDER BY fecha DESC
-    """, (anio_mes + "%",))
-    rows = c.fetchall()
+    c.close()
     conn.close()
     return rows
 
@@ -226,7 +217,7 @@ async def venta_precio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     utilidad = precio - costo - sueldo
 
     await update.message.reply_text(
-        f"✅ Venta guardada.\n\n"
+        f"✅ Venta guardada (base persistente).\n\n"
         f"Producto: {d['producto']} ×{d['cantidad']}\n"
         f"Máquina: {'CNC' if d['maquina']=='cnc' else 'Láser'}\n"
         f"Precio: ${precio:,.0f}\n"
@@ -331,6 +322,28 @@ async def tarifas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Listo, {context.args[0]} actualizado a {valor}")
 
 
+# ---------- Comando /backup ----------
+async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = todas_las_ventas()
+    if not rows:
+        await update.message.reply_text("No hay ventas cargadas todavía.")
+        return
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["fecha", "maquina", "producto", "cantidad", "minutos", "material", "precio", "usuario"])
+    writer.writerows(rows)
+
+    data = io.BytesIO(output.getvalue().encode("utf-8"))
+    data.name = f"backup-produccion-{datetime.now().strftime('%Y-%m-%d')}.csv"
+
+    await update.message.reply_document(
+        document=data,
+        filename=data.name,
+        caption=f"📦 Backup completo — {len(rows)} venta(s) cargada(s)."
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Registro de producción CNC + Láser\n\n"
@@ -345,7 +358,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
 
-    # Arranca el servidor web mínimo en un hilo aparte, para que Render lo vea "activo"
     threading.Thread(target=start_web_server, daemon=True).start()
 
     app = Application.builder().token(TOKEN).build()
@@ -370,7 +382,7 @@ def main():
     app.add_handler(CommandHandler("tarifas", tarifas))
     app.add_handler(CommandHandler("backup", backup))
 
-    print("Bot corriendo...")
+    print("Bot corriendo (base de datos persistente)...")
     app.run_polling()
 
 
