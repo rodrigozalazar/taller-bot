@@ -16,12 +16,31 @@ Comandos:
 
 import os
 import sqlite3
+import threading
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ConversationHandler,
     ContextTypes, filters
 )
+
+# ---------- Servidor web mínimo (para que Render lo trate como Web Service gratuito) ----------
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot corriendo")
+
+    def log_message(self, format, *args):
+        pass  # silencia el log de cada request para no llenar la consola
+
+
+def start_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
 
 # ---------- Configuración ----------
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "PONÉ_TU_TOKEN_ACÁ")
@@ -288,6 +307,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     init_db()
+
+    # Arranca el servidor web mínimo en un hilo aparte, para que Render lo vea "activo"
+    threading.Thread(target=start_web_server, daemon=True).start()
+
     app = Application.builder().token(TOKEN).build()
 
     conv = ConversationHandler(
