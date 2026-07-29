@@ -81,9 +81,11 @@ def init_db():
         )
     """)
     defaults = {
-        "tarifa_cnc": 55, "tarifa_laser": 54, "sueldo_hora": 9500,
-        "cnc_usd_min": 0.26, "laser_usd_min": 0.40, "sueldo_usd_hora": 6.15,
-        "dolar_actual": 1545, "margen_pct": 30
+        "tarifa_cnc": 98.36, "tarifa_laser": 56.80, "sueldo_hora": 8825,
+        "cnc_usd_min": 0.26, "laser_usd_min": 0.40, "sueldo_usd_hora": 5.71,
+        "tarifa_cnc_usd_min": 0.0637, "tarifa_laser_usd_min": 0.0368,
+        "dolar_actual": 1545, "margen_pct": 40,
+        "tarifa_mercado_cnc": 400, "tarifa_mercado_laser": 618
     }
     for k, v in defaults.items():
         c.execute(
@@ -483,9 +485,17 @@ async def venta_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ---------- Comando /cotizar (conversación guiada) ----------
+# ---------- Comando /cotizar (precio de MERCADO, para encargos a clientes) ----------
 async def cotizar_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["cot_modo"] = "mercado"
     await update.message.reply_text("¿Nombre del cliente?")
+    return COT_CLIENTE
+
+
+# ---------- Comando /cotizarmayorista (precio PISO, para clientes mayoristas) ----------
+async def cotizarmayorista_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["cot_modo"] = "mayorista"
+    await update.message.reply_text("¿Nombre del cliente/comercio mayorista?")
     return COT_CLIENTE
 
 
@@ -538,21 +548,59 @@ async def cotizar_material(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     d = context.user_data
     cfg = get_config()
-    tarifa = cfg["tarifa_cnc"] if d["cot_maquina"] == "cnc" else cfg["tarifa_laser"]
-    costo_tecnico = d["cot_minutos"] * tarifa
-    sueldo = (d["cot_minutos"] / 60) * cfg["sueldo_hora"]
-    base = costo_tecnico + sueldo + material
-    precio_total = base * (1 + cfg["margen_pct"] / 100)
+    modo = d.get("cot_modo", "mercado")
+
+    if modo == "mayorista":
+        # Precio PISO: costo técnico + sueldo (Rodrigo+empleado, ya combinado) + margen
+        tarifa = cfg["tarifa_cnc"] if d["cot_maquina"] == "cnc" else cfg["tarifa_laser"]
+        costo_tecnico = d["cot_minutos"] * tarifa
+        sueldo = (d["cot_minutos"] / 60) * cfg["sueldo_hora"]
+        base = costo_tecnico + sueldo + material
+        precio_total = base * (1 + cfg["margen_pct"] / 100)
+        precio_unitario = precio_total / d["cot_cantidad"] if d["cot_cantidad"] else precio_total
+
+        await update.message.reply_text(
+            f"🏭 Precio PISO calculado (mayorista)\n\n"
+            f"Cliente: {d['cot_cliente']}\n"
+            f"Producto: {d['cot_producto']} ×{d['cot_cantidad']}\n"
+            f"Costo técnico: ${costo_tecnico:,.0f}\n"
+            f"Sueldos (vos + empleado): ${sueldo:,.0f}\n"
+            f"Material: ${material:,.0f}\n"
+            f"Margen ({cfg['margen_pct']:.0f}%): ${precio_total - base:,.0f}\n"
+            f"────────────\n"
+            f"Precio total: ${precio_total:,.0f}\n\n"
+            f"Generando el PDF del presupuesto..."
+        )
+
+        pdf_buffer = generar_pdf_presupuesto(
+            cliente=d["cot_cliente"],
+            proyecto=d["cot_producto"],
+            descripcion=d["cot_producto"],
+            cantidad=d["cot_cantidad"],
+            precio_unitario=precio_unitario,
+            precio_total=precio_total,
+        )
+        nombre_limpio = "".join(ch for ch in d["cot_cliente"] if ch.isalnum() or ch == " ").strip().replace(" ", "-")
+        nombre_archivo = f"presupuesto-mayorista-{nombre_limpio or 'cliente'}-{datetime.now().strftime('%Y%m%d')}.pdf"
+
+        await update.message.reply_document(
+            document=pdf_buffer,
+            filename=nombre_archivo,
+            caption="📄 Presupuesto mayorista en PDF, listo para mandar por WhatsApp."
+        )
+        return ConversationHandler.END
+
+    # ----- Modo mercado: para presupuestos a clientes (encargos/servicios) -----
+    tarifa_mercado = cfg["tarifa_mercado_cnc"] if d["cot_maquina"] == "cnc" else cfg["tarifa_mercado_laser"]
+    precio_total = d["cot_minutos"] * tarifa_mercado + material
     precio_unitario = precio_total / d["cot_cantidad"] if d["cot_cantidad"] else precio_total
 
     await update.message.reply_text(
-        f"💰 Cotización calculada\n\n"
+        f"💰 Cotización calculada (precio de mercado)\n\n"
         f"Cliente: {d['cot_cliente']}\n"
         f"Producto: {d['cot_producto']} ×{d['cot_cantidad']}\n"
-        f"Costo técnico: ${costo_tecnico:,.0f}\n"
-        f"Tu tiempo: ${sueldo:,.0f}\n"
+        f"Tarifa de mercado: ${tarifa_mercado:,.0f}/min × {d['cot_minutos']:.0f} min\n"
         f"Material: ${material:,.0f}\n"
-        f"Margen ({cfg['margen_pct']:.0f}%): ${precio_total - base:,.0f}\n"
         f"────────────\n"
         f"Precio total: ${precio_total:,.0f}\n\n"
         f"Generando el PDF del presupuesto..."
@@ -646,20 +694,28 @@ async def tarifas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         cfg = get_config()
         await update.message.reply_text(
-            f"Tarifas actuales:\n"
-            f"CNC: ${cfg['tarifa_cnc']:.0f}/min\n"
-            f"Láser: ${cfg['tarifa_laser']:.0f}/min\n"
-            f"Sueldo objetivo: ${cfg['sueldo_hora']:.0f}/hora\n\n"
-            f"Para cambiar: /tarifas cnc 55  |  /tarifas laser 54  |  /tarifas sueldo 9500"
+            f"Tarifas técnicas (costo real):\n"
+            f"CNC: ${cfg['tarifa_cnc']:.2f}/min\n"
+            f"Láser: ${cfg['tarifa_laser']:.2f}/min\n"
+            f"Sueldo (vos+empleado combinado): ${cfg['sueldo_hora']:.0f}/hora\n"
+            f"Margen (/cotizarmayorista): {cfg['margen_pct']:.0f}%\n\n"
+            f"Tarifas de mercado (/cotizar):\n"
+            f"CNC: ${cfg['tarifa_mercado_cnc']:.0f}/min\n"
+            f"Láser: ${cfg['tarifa_mercado_laser']:.0f}/min\n\n"
+            f"Para cambiar: /tarifas cnc 98.36  |  /tarifas laser 56.80  |  /tarifas sueldo 8825\n"
+            f"/tarifas margen 40  |  /tarifas mercadocnc 400  |  /tarifas mercadolaser 618"
         )
         return
     if len(context.args) != 2:
-        await update.message.reply_text("Formato: /tarifas cnc 55")
+        await update.message.reply_text("Formato: /tarifas cnc 98.36")
         return
-    clave_map = {"cnc": "tarifa_cnc", "laser": "tarifa_laser", "sueldo": "sueldo_hora", "margen": "margen_pct"}
+    clave_map = {
+        "cnc": "tarifa_cnc", "laser": "tarifa_laser", "sueldo": "sueldo_hora", "margen": "margen_pct",
+        "mercadocnc": "tarifa_mercado_cnc", "mercadolaser": "tarifa_mercado_laser"
+    }
     clave = clave_map.get(context.args[0].lower())
     if not clave:
-        await update.message.reply_text("Usá: cnc, laser o sueldo")
+        await update.message.reply_text("Usá: cnc, laser, sueldo, margen, mercadocnc o mercadolaser")
         return
     try:
         valor = float(context.args[1])
@@ -754,12 +810,14 @@ async def dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             f"Dólar de referencia actual: ${cfg.get('dolar_actual', 0):.0f}\n\n"
-            f"Tarifas base en USD (no cambian):\n"
-            f"CNC: USD {cfg['cnc_usd_min']:.2f}/min\n"
-            f"Láser: USD {cfg['laser_usd_min']:.2f}/min\n"
-            f"Sueldo: USD {cfg['sueldo_usd_hora']:.2f}/hora\n\n"
-            f"Para actualizar con el dólar de hoy: /dolar 1600\n"
-            f"Para cambiar una tarifa base en USD: /basedolar cnc 0.26"
+            f"Bases en USD (no cambian solas, se ajustan con /basedolar):\n"
+            f"CNC técnico: USD {cfg['tarifa_cnc_usd_min']:.4f}/min\n"
+            f"Láser técnico: USD {cfg['tarifa_laser_usd_min']:.4f}/min\n"
+            f"Sueldo: USD {cfg['sueldo_usd_hora']:.2f}/hora\n"
+            f"CNC mercado: USD {cfg['cnc_usd_min']:.2f}/min\n"
+            f"Láser mercado: USD {cfg['laser_usd_min']:.2f}/min\n\n"
+            f"Para actualizar TODO con el dólar de hoy: /dolar 1600\n"
+            f"Para cambiar una base en USD: /basedolar cnctec 0.0637"
         )
         return
 
@@ -769,21 +827,27 @@ async def dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Mandame un número, ej: /dolar 1600")
         return
 
-    nueva_cnc = cfg["cnc_usd_min"] * valor_dolar
-    nueva_laser = cfg["laser_usd_min"] * valor_dolar
+    nueva_tec_cnc = cfg["tarifa_cnc_usd_min"] * valor_dolar
+    nueva_tec_laser = cfg["tarifa_laser_usd_min"] * valor_dolar
     nuevo_sueldo = cfg["sueldo_usd_hora"] * valor_dolar
+    nueva_mercado_cnc = cfg["cnc_usd_min"] * valor_dolar
+    nueva_mercado_laser = cfg["laser_usd_min"] * valor_dolar
 
-    set_config("tarifa_cnc", nueva_cnc)
-    set_config("tarifa_laser", nueva_laser)
+    set_config("tarifa_cnc", nueva_tec_cnc)
+    set_config("tarifa_laser", nueva_tec_laser)
     set_config("sueldo_hora", nuevo_sueldo)
+    set_config("tarifa_mercado_cnc", nueva_mercado_cnc)
+    set_config("tarifa_mercado_laser", nueva_mercado_laser)
     set_config("dolar_actual", valor_dolar)
 
     await update.message.reply_text(
-        f"💵 Tarifas actualizadas con dólar a ${valor_dolar:.0f}\n\n"
-        f"CNC: ${nueva_cnc:,.0f}/min (antes ${cfg['tarifa_cnc']:,.0f})\n"
-        f"Láser: ${nueva_laser:,.0f}/min (antes ${cfg['tarifa_laser']:,.0f})\n"
-        f"Sueldo: ${nuevo_sueldo:,.0f}/hora (antes ${cfg['sueldo_hora']:,.0f})\n\n"
-        f"Las ventas nuevas que cargues van a usar estos valores."
+        f"💵 Todo actualizado con dólar a ${valor_dolar:.0f}\n\n"
+        f"Técnico CNC: ${nueva_tec_cnc:,.2f}/min (antes ${cfg['tarifa_cnc']:,.2f})\n"
+        f"Técnico Láser: ${nueva_tec_laser:,.2f}/min (antes ${cfg['tarifa_laser']:,.2f})\n"
+        f"Sueldo: ${nuevo_sueldo:,.0f}/hora (antes ${cfg['sueldo_hora']:,.0f})\n"
+        f"Mercado CNC: ${nueva_mercado_cnc:,.0f}/min (antes ${cfg['tarifa_mercado_cnc']:,.0f})\n"
+        f"Mercado Láser: ${nueva_mercado_laser:,.0f}/min (antes ${cfg['tarifa_mercado_laser']:,.0f})\n\n"
+        f"/cotizar y /cotizarmayorista ya usan estos valores nuevos."
     )
 
 
@@ -791,25 +855,30 @@ async def dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def basedolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 2:
         await update.message.reply_text(
-            "Formato: /basedolar cnc 0.26  |  /basedolar laser 0.40  |  /basedolar sueldo 6.15\n\n"
-            "Esto cambia la tarifa BASE en dólares (la referencia que se usa con /dolar), "
-            "no la tarifa en pesos directamente."
+            "Formato: /basedolar cnctec 0.0637  |  /basedolar lasertec 0.0368\n"
+            "/basedolar sueldo 5.71  |  /basedolar cncmercado 0.26  |  /basedolar lasermercado 0.40\n\n"
+            "Esto cambia la base en dólares (la referencia que usa /dolar para recalcular), "
+            "no el valor en pesos directamente."
         )
         return
-    clave_map = {"cnc": "cnc_usd_min", "laser": "laser_usd_min", "sueldo": "sueldo_usd_hora"}
+    clave_map = {
+        "cnctec": "tarifa_cnc_usd_min", "lasertec": "tarifa_laser_usd_min",
+        "sueldo": "sueldo_usd_hora",
+        "cncmercado": "cnc_usd_min", "lasermercado": "laser_usd_min"
+    }
     clave = clave_map.get(context.args[0].lower())
     if not clave:
-        await update.message.reply_text("Usá: cnc, laser o sueldo")
+        await update.message.reply_text("Usá: cnctec, lasertec, sueldo, cncmercado o lasermercado")
         return
     try:
         valor = float(context.args[1].replace(",", "."))
     except ValueError:
-        await update.message.reply_text("Mandame un número válido, ej: 0.26")
+        await update.message.reply_text("Mandame un número válido, ej: 0.0637")
         return
     set_config(clave, valor)
     await update.message.reply_text(
         f"Listo, base en USD de {context.args[0]} actualizada a {valor}.\n"
-        f"Usá /dolar <valor> para recalcular las tarifas en pesos con este nuevo valor base."
+        f"Usá /dolar <valor> para recalcular todo con este nuevo valor base."
     )
 
 
@@ -839,7 +908,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Registro de producción CNC + Láser\n\n"
         "/venta - cargar una venta nueva\n"
-        "/cotizar - armar un presupuesto en PDF para mandar al cliente\n"
+        "/cotizar - armar un presupuesto en PDF a precio de MERCADO (encargos/clientes)\n"
+        "/cotizarmayorista - presupuesto en PDF a precio PISO (clientes mayoristas)\n"
         "/negocio - ver o cambiar datos del presupuesto (dirección, seña, etc.)\n"
         "/resumen - ver el mes actual\n"
         "/mes 2026-06 - ver un mes específico\n"
@@ -875,7 +945,10 @@ def main():
     app.add_handler(conv)
 
     cotizar_conv = ConversationHandler(
-        entry_points=[CommandHandler("cotizar", cotizar_start)],
+        entry_points=[
+            CommandHandler("cotizar", cotizar_start),
+            CommandHandler("cotizarmayorista", cotizarmayorista_start),
+        ],
         states={
             COT_CLIENTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, cotizar_cliente)],
             COT_PRODUCTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, cotizar_producto)],
@@ -887,6 +960,7 @@ def main():
         fallbacks=[CommandHandler("cancelar", cotizar_cancelar)],
     )
     app.add_handler(cotizar_conv)
+
 
     app.add_handler(CommandHandler("resumen", resumen))
     app.add_handler(CommandHandler("mes", resumen_mes))
