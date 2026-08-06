@@ -1204,6 +1204,51 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ---------- Comando /sincronizarpendientes (backfill único) ----------
+async def sincronizarpendientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not FINANZAS_DATABASE_URL:
+        await update.message.reply_text(
+            "FINANZAS_DATABASE_URL no está configurada todavía — no hay a dónde sincronizar."
+        )
+        return
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, fecha, maquina, producto, cantidad, precio, usuario
+        FROM ventas WHERE movimiento_finanzas_id IS NULL ORDER BY id ASC
+    """)
+    pendientes = c.fetchall()
+    c.close()
+    conn.close()
+
+    if not pendientes:
+        await update.message.reply_text("No hay ventas pendientes de sincronizar. Todo al día.")
+        return
+
+    await update.message.reply_text(f"Encontré {len(pendientes)} venta(s) sin sincronizar. Arrancando...")
+
+    sincronizadas = 0
+    for venta_id, fecha, maquina, producto, cantidad, precio, usuario in pendientes:
+        nombre_maquina = "CNC" if maquina == "cnc" else "Láser"
+        descripcion = f"{producto} ×{cantidad} ({nombre_maquina}) [backfill]"
+        movimiento_id = sincronizar_con_finanzas("ingreso", "venta", descripcion, precio, usuario or "desconocido")
+        if movimiento_id:
+            conn2 = get_conn()
+            c2 = conn2.cursor()
+            c2.execute("UPDATE ventas SET movimiento_finanzas_id = %s WHERE id = %s", (movimiento_id, venta_id))
+            conn2.commit()
+            c2.close()
+            conn2.close()
+            sincronizadas += 1
+
+    await update.message.reply_text(
+        f"✅ Listo: {sincronizadas} de {len(pendientes)} venta(s) sincronizada(s) con finanzas.\n\n"
+        f"Nota: se usó la cotización del dólar de HOY para todas, no la del día real de cada venta "
+        f"(no se puede recuperar la cotización histórica exacta con la API que usamos)."
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Registro de producción CNC + Láser\n\n"
@@ -1288,6 +1333,7 @@ def main():
     app.add_handler(CommandHandler("ultimas", ultimas))
     app.add_handler(CommandHandler("borrar", borrar))
     app.add_handler(CommandHandler("negocio", negocio))
+    app.add_handler(CommandHandler("sincronizarpendientes", sincronizarpendientes))
 
     print("Bot corriendo (base de datos persistente)...")
     app.run_polling()
