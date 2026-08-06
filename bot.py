@@ -20,6 +20,7 @@ import csv
 import io
 from datetime import datetime
 import psycopg2
+import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
@@ -31,10 +32,15 @@ from telegram.ext import (
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "PONÉ_TU_TOKEN_ACÁ")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
+# Puente con el bot de finanzas: si está configurado, cada venta y cada
+# gasto también se escriben allá como un movimiento de la cuenta lasercnc.
+# Si no está configurado (o falla la conexión), el bot del taller sigue
+# funcionando normal — nunca se corta el flujo por esto.
+FINANZAS_DATABASE_URL = os.environ.get("FINANZAS_DATABASE_URL", "")
+
 MAQUINA, PRODUCTO, CANTIDAD, MINUTOS, MATERIAL, PRECIO = range(6)
-CANCEL_KEYBOARD = ReplyKeyboardMarkup([["Cancelar"]], resize_keyboard=True)
 COT_CLIENTE, COT_PRODUCTO, COT_CANTIDAD, COT_MAQUINA, COT_MINUTOS, COT_MATERIAL = range(6, 12)
-GASTO_CATEGORIA, GASTO_DESCRIPCION, GASTO_MONTO = range(12, 15)
+GASTO_CATEGORIA, GASTO_DESCRIPCION, GASTO_MONTO, GASTO_FORMAPAGO = range(12, 16)
 
 
 # ---------- Servidor web mínimo (para que Render lo trate como Web Service gratuito) ----------
@@ -44,6 +50,11 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_header("Content-type", "text/plain")
         self.end_headers()
         self.wfile.write(b"Bot corriendo")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
 
     def log_message(self, format, *args):
         pass
@@ -73,9 +84,12 @@ def init_db():
             minutos REAL NOT NULL,
             material REAL NOT NULL,
             precio REAL NOT NULL,
-            usuario TEXT
+            usuario TEXT,
+            movimiento_finanzas_id INTEGER
         )
     """)
+    # Por si la tabla ya existía de antes del puente con finanzas
+    c.execute("ALTER TABLE ventas ADD COLUMN IF NOT EXISTS movimiento_finanzas_id INTEGER")
     c.execute("""
         CREATE TABLE IF NOT EXISTS config (
             clave TEXT PRIMARY KEY,
@@ -89,9 +103,11 @@ def init_db():
             categoria TEXT NOT NULL,
             descripcion TEXT NOT NULL,
             monto REAL NOT NULL,
-            usuario TEXT
+            usuario TEXT,
+            forma_pago TEXT DEFAULT 'efectivo'
         )
     """)
+    c.execute("ALTER TABLE gastos ADD COLUMN IF NOT EXISTS forma_pago TEXT DEFAULT 'efectivo'")
     defaults = {
         "tarifa_cnc": 98.36, "tarifa_laser": 56.80, "sueldo_hora": 8825,
         "cnc_usd_min": 0.26, "laser_usd_min": 0.40, "sueldo_usd_hora": 5.71,
@@ -130,13 +146,82 @@ def set_config(clave, valor):
     conn.close()
 
 
+# ---------- Puente con el bot de finanzas ----------
+def obtener_dolar_blue():
+    """Misma lógica que usa el bot de finanzas, para que la cotización sea consistente."""
+    try:
+        r = requests.get("https://dolarapi.com/v1/dolares/blue", timeout=5)
+        r.raise_for_status()
+        return float(r.json()["venta"])
+    except Exception:
+        pass
+    try:
+        r = requests.get("https://api.bluelytics.com.ar/v2/latest", timeout=5)
+        r.raise_for_status()
+        return float(r.json()["blue"]["value_sell"])
+    except Exception:
+        return None
+
+
+def sincronizar_con_finanzas(tipo, categoria, descripcion, monto, usuario):
+    """
+    Escribe el movimiento también en la base del bot de finanzas, como parte
+    de la cuenta 'lasercnc'. Si FINANZAS_DATABASE_URL no está configurada o
+    la conexión falla, no hace nada y no interrumpe el flujo del bot del
+    taller — la venta o el gasto ya se guardaron bien en su propia base.
+    Devuelve el id del movimiento creado en finanzas (o None si no se pudo),
+    para poder borrarlo en cascada si más adelante se borra la venta/gasto.
+    """
+    if not FINANZAS_DATABASE_URL:
+        return None
+    try:
+        cotizacion = obtener_dolar_blue()
+        monto_usd = (monto / cotizacion) if cotizacion else None
+        fecha = datetime.now().strftime("%Y-%m-%d")
+        conn = psycopg2.connect(FINANZAS_DATABASE_URL)
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO movimientos
+                (fecha, cuenta, tipo, categoria, descripcion, monto, monto_usd, cotizacion_blue, usuario)
+            VALUES (%s, 'lasercnc', %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (fecha, tipo, categoria, descripcion, monto, monto_usd, cotizacion, usuario))
+        movimiento_id = c.fetchone()[0]
+        conn.commit()
+        c.close()
+        conn.close()
+        return movimiento_id
+    except Exception as e:
+        # No relanzamos el error: si falla la sincronización, el bot del
+        # taller sigue funcionando normal. Solo queda en los logs de Render.
+        print(f"[puente-finanzas] No se pudo sincronizar: {e}")
+        return None
+
+
+def borrar_movimiento_en_finanzas(movimiento_id):
+    """Borra un movimiento puntual en la base de finanzas por su id (usado al borrar una venta)."""
+    if not FINANZAS_DATABASE_URL or not movimiento_id:
+        return
+    try:
+        conn = psycopg2.connect(FINANZAS_DATABASE_URL)
+        c = conn.cursor()
+        c.execute("DELETE FROM movimientos WHERE id = %s", (movimiento_id,))
+        conn.commit()
+        c.close()
+        conn.close()
+    except Exception as e:
+        print(f"[puente-finanzas] No se pudo borrar el movimiento sincronizado: {e}")
+
+
 def guardar_venta(fecha, maquina, producto, cantidad, minutos, material, precio, usuario):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
         INSERT INTO ventas (fecha, maquina, producto, cantidad, minutos, material, precio, usuario)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
     """, (fecha, maquina, producto, cantidad, minutos, material, precio, usuario))
+    venta_id = c.fetchone()[0]
     conn.commit()
     c.close()
     conn.close()
@@ -148,17 +233,41 @@ def guardar_venta(fecha, maquina, producto, cantidad, minutos, material, precio,
         cfg = get_config()
         set_config("horas_acum_fresa_min", cfg.get("horas_acum_fresa_min", 0) + minutos)
 
+    # Puente: la venta también se carga como ingreso en el bot de finanzas.
+    # Guardamos el id del movimiento creado allá, vinculado a esta venta,
+    # para poder borrarlo en cascada si más adelante se borra la venta.
+    nombre_maquina = "CNC" if maquina == "cnc" else "Láser"
+    descripcion = f"{producto} ×{cantidad} ({nombre_maquina})"
+    movimiento_id = sincronizar_con_finanzas("ingreso", "venta", descripcion, precio, usuario)
+    if movimiento_id:
+        conn2 = get_conn()
+        c2 = conn2.cursor()
+        c2.execute("UPDATE ventas SET movimiento_finanzas_id = %s WHERE id = %s", (movimiento_id, venta_id))
+        conn2.commit()
+        c2.close()
+        conn2.close()
 
-def guardar_gasto(fecha, categoria, descripcion, monto, usuario):
+
+def guardar_gasto(fecha, categoria, descripcion, monto, usuario, forma_pago="efectivo", sincronizar=True):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        INSERT INTO gastos (fecha, categoria, descripcion, monto, usuario)
-        VALUES (%s, %s, %s, %s, %s)
-    """, (fecha, categoria, descripcion, monto, usuario))
+        INSERT INTO gastos (fecha, categoria, descripcion, monto, usuario, forma_pago)
+        VALUES (%s, %s, %s, %s, %s, %s)
+    """, (fecha, categoria, descripcion, monto, usuario, forma_pago))
     conn.commit()
     c.close()
     conn.close()
+
+    # Puente: el gasto se carga como egreso en el bot de finanzas, PERO SOLO
+    # si no fue pagado con un cheque que ya se cargó ahí a mano — si no,
+    # quedaría contado dos veces (una por el cheque, otra por este gasto).
+    if sincronizar:
+        categoria_finanzas = {
+            "Fresas": "fresas", "Tubo láser": "tubo",
+            "Mantenimiento": "mantenimiento", "Otro": "otro",
+        }.get(categoria, "otro")
+        sincronizar_con_finanzas("egreso", categoria_finanzas, descripcion, monto, usuario)
 
 
 def gastos_del_mes(anio_mes):
@@ -216,14 +325,21 @@ def ultimas_ventas(cantidad=10):
 def borrar_venta_por_id(venta_id):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT id FROM ventas WHERE id = %s", (venta_id,))
-    existe = c.fetchone()
-    if existe:
+    c.execute("SELECT id, movimiento_finanzas_id FROM ventas WHERE id = %s", (venta_id,))
+    row = c.fetchone()
+    if row:
         c.execute("DELETE FROM ventas WHERE id = %s", (venta_id,))
         conn.commit()
     c.close()
     conn.close()
-    return existe is not None
+
+    if row:
+        # Borrado en cascada: si esta venta tenía un movimiento vinculado
+        # en la base de finanzas, lo borramos también para que no queden
+        # números que no cierran entre los dos bots.
+        borrar_movimiento_en_finanzas(row[1])
+
+    return row is not None
 
 
 def generar_pdf_presupuesto(cliente, proyecto, descripcion, cantidad, precio_unitario, precio_total):
@@ -266,7 +382,6 @@ def generar_pdf_presupuesto(cliente, proyecto, descripcion, cantidad, precio_uni
                              leftMargin=18*mm, rightMargin=18*mm)
     elems = []
 
-    # Header: dirección izquierda | logo centro | datos presupuesto derecha
     try:
         logo_img = Image("logo.png", width=26*mm, height=26*mm)
     except Exception:
@@ -289,7 +404,6 @@ def generar_pdf_presupuesto(cliente, proyecto, descripcion, cantidad, precio_uni
     elems.append(HRFlowable(width="100%", thickness=1.2, color=verde))
     elems.append(Spacer(1, 8*mm))
 
-    # Cliente / Proyecto
     cliente_proyecto = Table([[
         Paragraph(f"<font size=7.5 color='#8a8577'>CLIENTE</font><br/><b>{cliente}</b>", normal),
         Paragraph(f"<font size=7.5 color='#8a8577'>PROYECTO</font><br/><b>{proyecto}</b>", normal),
@@ -303,7 +417,6 @@ def generar_pdf_presupuesto(cliente, proyecto, descripcion, cantidad, precio_uni
     elems.append(cliente_proyecto)
     elems.append(Spacer(1, 8*mm))
 
-    # Detalle
     elems.append(Paragraph("<font size=7.5 color='#8a8577'>DETALLE</font>", normal))
     elems.append(Spacer(1, 3*mm))
 
@@ -329,7 +442,6 @@ def generar_pdf_presupuesto(cliente, proyecto, descripcion, cantidad, precio_uni
     elems.append(total_table)
     elems.append(Spacer(1, 6*mm))
 
-    # Seña
     sena_table = Table([[
         Paragraph(f"Seña para confirmar trabajo ({sena_pct:.0f}%)", normal),
         Paragraph(f"<b>${sena_monto:,.0f}</b>", right_bold)
@@ -345,7 +457,6 @@ def generar_pdf_presupuesto(cliente, proyecto, descripcion, cantidad, precio_uni
     elems.append(sena_table)
     elems.append(Spacer(1, 8*mm))
 
-    # Condiciones comerciales
     elems.append(Paragraph("<font size=7.5 color='#8a8577'>CONDICIONES COMERCIALES</font>", normal))
     elems.append(Spacer(1, 3*mm))
     condiciones = [
@@ -443,8 +554,6 @@ def set_config_texto(clave, valor):
     conn.close()
 
 
-
-
 async def venta_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = ReplyKeyboardMarkup([["CNC", "Láser"]], one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text("¿Qué máquina usaste?", reply_markup=keyboard)
@@ -454,13 +563,13 @@ async def venta_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def venta_maquina(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texto = update.message.text.strip().lower()
     context.user_data["maquina"] = "cnc" if "cnc" in texto else "laser"
-    await update.message.reply_text("¿Qué producto o para qué cliente? (texto libre)", reply_markup=CANCEL_KEYBOARD)
+    await update.message.reply_text("¿Qué producto o para qué cliente? (texto libre)", reply_markup=ReplyKeyboardRemove())
     return PRODUCTO
 
 
 async def venta_producto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["producto"] = update.message.text.strip()
-    await update.message.reply_text("¿Cantidad de piezas?", reply_markup=CANCEL_KEYBOARD)
+    await update.message.reply_text("¿Cantidad de piezas?")
     return CANTIDAD
 
 
@@ -470,7 +579,7 @@ async def venta_cantidad(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Mandame un número entero, ej: 20")
         return CANTIDAD
-    await update.message.reply_text("¿Cuántos minutos totales de máquina llevó?", reply_markup=CANCEL_KEYBOARD)
+    await update.message.reply_text("¿Cuántos minutos totales de máquina llevó?")
     return MINUTOS
 
 
@@ -480,7 +589,7 @@ async def venta_minutos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Mandame un número, ej: 45 o 45.5")
         return MINUTOS
-    await update.message.reply_text("¿Costo de material total? (0 si no aplica)", reply_markup=CANCEL_KEYBOARD)
+    await update.message.reply_text("¿Costo de material total? (0 si no aplica)")
     return MATERIAL
 
 
@@ -496,7 +605,7 @@ async def venta_material(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "cargá igual un 30-40% del valor de un tablero nuevo equivalente — no es gratis, "
             "tiene valor de reposición real."
         )
-    await update.message.reply_text("¿Precio total cobrado?", reply_markup=CANCEL_KEYBOARD)
+    await update.message.reply_text("¿Precio total cobrado?")
     return PRECIO
 
 
@@ -537,38 +646,27 @@ async def venta_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def comando_inesperado(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "⚠️ Estás a mitad de una carga. Tocá el botón *Cancelar* (o mandá /cancelar) "
-        "antes de usar otro comando.",
-        parse_mode="Markdown"
-    )
-    return None  # no cambia de estado, sigue esperando la respuesta pendiente
-
-
-# ---------- Comando /cotizar (precio de MERCADO, para encargos a clientes) ----------
 async def cotizar_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["cot_modo"] = "mercado"
-    await update.message.reply_text("¿Nombre del cliente?", reply_markup=CANCEL_KEYBOARD)
+    await update.message.reply_text("¿Nombre del cliente?")
     return COT_CLIENTE
 
 
-# ---------- Comando /cotizarmayorista (precio PISO, para clientes mayoristas) ----------
 async def cotizarmayorista_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["cot_modo"] = "mayorista"
-    await update.message.reply_text("¿Nombre del cliente/comercio mayorista?", reply_markup=CANCEL_KEYBOARD)
+    await update.message.reply_text("¿Nombre del cliente/comercio mayorista?")
     return COT_CLIENTE
 
 
 async def cotizar_cliente(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["cot_cliente"] = update.message.text.strip()
-    await update.message.reply_text("¿Qué producto o trabajo vas a cotizar? (texto libre)", reply_markup=CANCEL_KEYBOARD)
+    await update.message.reply_text("¿Qué producto o trabajo vas a cotizar? (texto libre)")
     return COT_PRODUCTO
 
 
 async def cotizar_producto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["cot_producto"] = update.message.text.strip()
-    await update.message.reply_text("¿Cantidad de piezas?", reply_markup=CANCEL_KEYBOARD)
+    await update.message.reply_text("¿Cantidad de piezas?")
     return COT_CANTIDAD
 
 
@@ -586,7 +684,7 @@ async def cotizar_cantidad(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cotizar_maquina(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texto = update.message.text.strip().lower()
     context.user_data["cot_maquina"] = "cnc" if "cnc" in texto else "laser"
-    await update.message.reply_text("¿Cuántos minutos totales estimás de máquina (para todas las piezas)?", reply_markup=CANCEL_KEYBOARD)
+    await update.message.reply_text("¿Cuántos minutos totales estimás de máquina (para todas las piezas)?", reply_markup=ReplyKeyboardRemove())
     return COT_MINUTOS
 
 
@@ -596,7 +694,7 @@ async def cotizar_minutos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Mandame un número, ej: 35")
         return COT_MINUTOS
-    await update.message.reply_text("¿Costo de material total estimado? (0 si no aplica)", reply_markup=CANCEL_KEYBOARD)
+    await update.message.reply_text("¿Costo de material total estimado? (0 si no aplica)")
     return COT_MATERIAL
 
 
@@ -618,7 +716,6 @@ async def cotizar_material(update: Update, context: ContextTypes.DEFAULT_TYPE):
     modo = d.get("cot_modo", "mercado")
 
     if modo == "mayorista":
-        # Precio PISO: costo técnico + sueldo (Rodrigo+empleado, ya combinado) + margen
         tarifa = cfg["tarifa_cnc"] if d["cot_maquina"] == "cnc" else cfg["tarifa_laser"]
         costo_tecnico = d["cot_minutos"] * tarifa
         sueldo = (d["cot_minutos"] / 60) * cfg["sueldo_hora"]
@@ -657,7 +754,6 @@ async def cotizar_material(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    # ----- Modo mercado: para presupuestos a clientes (encargos/servicios) -----
     tarifa_mercado = cfg["tarifa_mercado_cnc"] if d["cot_maquina"] == "cnc" else cfg["tarifa_mercado_laser"]
     precio_total = d["cot_minutos"] * tarifa_mercado + material
     precio_unitario = precio_total / d["cot_cantidad"] if d["cot_cantidad"] else precio_total
@@ -697,7 +793,6 @@ async def cotizar_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ---------- Comando /resumen ----------
 def calcular_resumen(anio_mes):
     cfg = get_config()
     rows = ventas_del_mes(anio_mes)
@@ -756,7 +851,6 @@ async def resumen_mes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ---------- Comando /tarifas ----------
 async def tarifas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         cfg = get_config()
@@ -793,7 +887,6 @@ async def tarifas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Listo, {context.args[0]} actualizado a {valor}")
 
 
-# ---------- Comando /ultimas ----------
 async def ultimas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = ultimas_ventas(10)
     if not rows:
@@ -808,7 +901,6 @@ async def ultimas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lineas))
 
 
-# ---------- Comando /borrar ----------
 async def borrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usá el formato: /borrar 7 (mirá el número con /ultimas)")
@@ -821,12 +913,14 @@ async def borrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ok = borrar_venta_por_id(venta_id)
     if ok:
-        await update.message.reply_text(f"🗑️ Venta #{venta_id} borrada correctamente.")
+        await update.message.reply_text(
+            f"🗑️ Venta #{venta_id} borrada correctamente.\n"
+            f"(También se borró el movimiento correspondiente en el bot de finanzas, si estaba sincronizado.)"
+        )
     else:
         await update.message.reply_text(f"No encontré ninguna venta con el número #{venta_id}. Revisá con /ultimas.")
 
 
-# ---------- Comando /negocio ----------
 async def negocio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         cfg = get_config_texto()
@@ -918,7 +1012,6 @@ async def dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ---------- Comando /basedolar (para ajustar las tarifas base en USD, poco frecuente) ----------
 async def basedolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 2:
         await update.message.reply_text(
@@ -949,7 +1042,6 @@ async def basedolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ---------- Comando /gasto (conversación guiada) ----------
 async def gasto_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = ReplyKeyboardMarkup(
         [["Fresas", "Tubo láser"], ["Mantenimiento", "Otro"]],
@@ -961,29 +1053,54 @@ async def gasto_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def gasto_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["gasto_categoria"] = update.message.text.strip()
-    await update.message.reply_text("¿Descripción del gasto? (ej: fresa compression 8mm)", reply_markup=CANCEL_KEYBOARD)
+    await update.message.reply_text("¿Descripción del gasto? (ej: fresa compression 8mm)", reply_markup=ReplyKeyboardRemove())
     return GASTO_DESCRIPCION
 
 
 async def gasto_descripcion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["gasto_descripcion"] = update.message.text.strip()
-    await update.message.reply_text("¿Monto del gasto?", reply_markup=CANCEL_KEYBOARD)
+    await update.message.reply_text("¿Monto del gasto?")
     return GASTO_MONTO
 
 
 async def gasto_monto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        monto = float(update.message.text.strip().replace(",", "."))
+        context.user_data["gasto_monto"] = float(update.message.text.strip().replace(",", "."))
     except ValueError:
         await update.message.reply_text("Mandame un número, ej: 30000")
         return GASTO_MONTO
 
+    keyboard = ReplyKeyboardMarkup(
+        [["Efectivo / transferencia"], ["Cheque (ya cargado en finanzas)"]],
+        one_time_keyboard=True, resize_keyboard=True
+    )
+    await update.message.reply_text(
+        "¿Cómo lo pagaste? Si ya cargaste el cheque en el bot de finanzas, elegí esa "
+        "opción para no duplicar el gasto ahí.",
+        reply_markup=keyboard
+    )
+    return GASTO_FORMAPAGO
+
+
+async def gasto_formapago(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    texto = update.message.text.strip().lower()
+    if "cheque" in texto:
+        forma_pago = "cheque"
+        sincronizar = False
+    elif "efectivo" in texto or "transferencia" in texto:
+        forma_pago = "efectivo"
+        sincronizar = True
+    else:
+        await update.message.reply_text("Elegí una opción del teclado.")
+        return GASTO_FORMAPAGO
+
     d = context.user_data
+    monto = d["gasto_monto"]
     fecha = datetime.now().strftime("%Y-%m-%d")
     usuario = update.effective_user.first_name or "desconocido"
-    guardar_gasto(fecha, d["gasto_categoria"], d["gasto_descripcion"], monto, usuario)
+    guardar_gasto(fecha, d["gasto_categoria"], d["gasto_descripcion"], monto, usuario,
+                  forma_pago=forma_pago, sincronizar=sincronizar)
 
-    # Si es un gasto de reposición, ofrecer reiniciar el contador de vida útil
     aviso_reset = ""
     if d["gasto_categoria"] == "Tubo láser":
         set_config("horas_acum_tubo_min", 0)
@@ -991,13 +1108,22 @@ async def gasto_monto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif d["gasto_categoria"] == "Fresas":
         aviso_reset = "\n\n💡 Si esta fresa reemplaza a la anterior por desgaste, usá /resetvidautil fresa para reiniciar el contador."
 
+    aviso_sync = (
+        "\n\n💡 No se sincronizó con finanzas (ya está cargado ahí como cheque)."
+        if not sincronizar else ""
+    )
+
     await update.message.reply_text(
         f"💸 Gasto registrado.\n\n"
         f"Categoría: {d['gasto_categoria']}\n"
         f"Descripción: {d['gasto_descripcion']}\n"
-        f"Monto: ${monto:,.0f}"
-        f"{aviso_reset}\n\n"
-        f"Usá /gastos para ver el total del mes."
+        f"Monto: ${monto:,.0f}\n"
+        f"Forma de pago: {forma_pago}"
+        f"{aviso_reset}"
+        f"{aviso_sync}\n\n"
+        f"Usá /gastos para ver el total del mes.",
+        reply_markup=ReplyKeyboardRemove()
+
     )
     return ConversationHandler.END
 
@@ -1007,7 +1133,6 @@ async def gasto_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ---------- Comando /gastos (ver resumen del mes) ----------
 async def gastos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     anio_mes = context.args[0] if context.args else datetime.now().strftime("%Y-%m")
     rows = gastos_del_mes(anio_mes)
@@ -1027,7 +1152,6 @@ async def gastos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lineas))
 
 
-# ---------- Comando /vidautil ----------
 async def vidautil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = get_config()
     horas_tubo = cfg.get("horas_acum_tubo_min", 0) / 60
@@ -1057,7 +1181,6 @@ async def resetvidautil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clave = "horas_acum_tubo_min" if context.args[0].lower() == "tubo" else "horas_acum_fresa_min"
     set_config(clave, 0)
     await update.message.reply_text(f"✅ Contador de {context.args[0]} reiniciado a 0 horas.")
-
 
 
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1119,8 +1242,7 @@ def main():
             MATERIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, venta_material)],
             PRECIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, venta_precio)],
         },
-        fallbacks=[CommandHandler("cancelar", venta_cancelar), MessageHandler(filters.Regex("(?i)^cancelar$"), venta_cancelar), MessageHandler(filters.COMMAND, comando_inesperado)],
-        allow_reentry=True,
+        fallbacks=[CommandHandler("cancelar", venta_cancelar)],
     )
 
     app.add_handler(CommandHandler("start", start))
@@ -1139,11 +1261,9 @@ def main():
             COT_MINUTOS: [MessageHandler(filters.TEXT & ~filters.COMMAND, cotizar_minutos)],
             COT_MATERIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, cotizar_material)],
         },
-        fallbacks=[CommandHandler("cancelar", cotizar_cancelar), MessageHandler(filters.Regex("(?i)^cancelar$"), cotizar_cancelar), MessageHandler(filters.COMMAND, comando_inesperado)],
-        allow_reentry=True,
+        fallbacks=[CommandHandler("cancelar", cotizar_cancelar)],
     )
     app.add_handler(cotizar_conv)
-
 
     app.add_handler(CommandHandler("resumen", resumen))
     app.add_handler(CommandHandler("mes", resumen_mes))
@@ -1154,9 +1274,9 @@ def main():
             GASTO_CATEGORIA: [MessageHandler(filters.TEXT & ~filters.COMMAND, gasto_categoria)],
             GASTO_DESCRIPCION: [MessageHandler(filters.TEXT & ~filters.COMMAND, gasto_descripcion)],
             GASTO_MONTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, gasto_monto)],
+            GASTO_FORMAPAGO: [MessageHandler(filters.TEXT & ~filters.COMMAND, gasto_formapago)],
         },
-        fallbacks=[CommandHandler("cancelar", gasto_cancelar), MessageHandler(filters.Regex("(?i)^cancelar$"), gasto_cancelar), MessageHandler(filters.COMMAND, comando_inesperado)],
-        allow_reentry=True,
+        fallbacks=[CommandHandler("cancelar", gasto_cancelar)],
     )
     app.add_handler(gasto_conv)
     app.add_handler(CommandHandler("gastos", gastos))
